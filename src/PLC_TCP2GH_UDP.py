@@ -8,56 +8,84 @@ import struct
 import argparse
 import _thread
 
+from Utils import create_logger, create_TempFolder
 
 def get_time():
     end_time = time.clock()
     print("运行时长： %.2f 秒"%(end_time-start_time), end="\r")
 
-def clientGetRes(host,  port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(3)
-    s.connect((host, port))
-    print("Successfully ! 连接 PLC 成功！")
-    res1 , res2 = [0] * 8,[0]*8
-    count = 10 
-    flag = -1
-    print("监听程序....")
-    print("机械臂正在运动至指定位置....")
-    while count > 0:   
-        packet = s.recv(200)
-        info = struct.unpack("!200s",packet)[0]
-        info_str = str(info, encoding = "utf-8")
-        is_start1 = info_str[:10].rstrip().lstrip() # 去除空格
-        if is_start1 == "start1":
-            print("接收得到 机械臂1 数据......")
-            for i in range(8):
-                d1 = info_str[(i+1)*10:(i+2)*10].rstrip().lstrip() 
-                if d1:
-                    res1[i] = float(d1)
-                else:
-                    res1[i] = -999
-            flag += 1
-            print("res1: ", res1)
-        is_start2 = info_str[100:110].rstrip().lstrip() # 去除空格
-        if is_start2 == "start2":
-            print("接收得到 机械臂2 数据......")
-            for i in range(10, 18):
-                d2 = info_str[(i+1)*10:(i+2)*10].rstrip().lstrip() 
-                if d2:
-                    res2[i-10] = float(d2)
-                else:
-                    res2[i-10] = -999
-            flag += 1
-            print("res2:", res2)
-        if flag >= 0:
-            break
-        if is_start1 == "errorstart":
-            error_info = info_str[10:].rstrip().lstrip()
-            # print("%s error info: %s"%(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) , error_info))
-            raise Exception("%s error info: %s"%(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) , error_info))   # 用于后面捕获异常
-        # count -= 1   # 测试用
-        # print(info_str)
-    return res1,res2
+
+class GhClient(object):
+    def __init__(self, addr, port):
+        self.udpaddr = (addr, port)  # 接收方 服务器的ip地址和端口号
+        self.udpserver = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    
+    def broadcast(self, msg_str):
+        LOG.debug("向grasshopper 广播数据: %s"%msg_str)
+        self.udpserver.sendto(msg_str.encode("utf-8"), self.udpaddr)
+        LOG.debug("广播结束")
+
+class PlcClient(object):
+    def __init__(self,addr, port, timeout=3):
+        self.addr = addr
+        self.port = port
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.s.settimeout(timeout)
+    
+    def connect(self):
+        self.s.connect((self.addr, self.port))
+        LOG.info("Successfully ! 连接 PLC 成功！")
+    
+    def disconnect(self):
+        LOG.info("断开与PLC的网络连接")
+        self.s.close()
+    
+    def _decodeLaserDate(self,robot_num, info_str):
+        """
+            robot_num: int ,0,1,2... which robot
+        """
+        res = [-999] * 8 
+        LOG.debug("接收得到 机械臂 %d 数据......"%robot_num)
+        for i in range(robot_num*10,robot_num*10+8):
+            info_data = info_str[(i+1)*10:(i+2)*10].rstrip().lstrip() 
+            if info_data:
+                res[int(i%10)] = float(info_data)
+        return res
+
+    def sendRes(self,bufsize=200, ghclient = None):
+        count = 10 
+        flag = -1
+        LOG.info("监听程序....")
+        LOG.info("机械臂正在运动至指定位置....")
+        while count > 0:  
+            packet = self.s.recv(bufsize)
+            info = struct.unpack("!200s",packet)[0]
+            info_str = str(info, encoding = "utf-8")
+            head1 = info_str[:10].rstrip().lstrip() # 获得前10个字符数据并进行判断
+            head2 = info_str[100:110].rstrip().lstrip()
+            if head1 == "errorstart":
+                error_info = info_str[10:].rstrip().lstrip()
+                # todo 查找alarm_information
+                raise Exception("%s error: %s"%(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) , error_info))   # 用于后面捕获异常
+            if head1 == "start1":
+                res1 = self._decodeLaserDate(0, info_str)
+                flag += 1
+                LOG.debug("res1: %s"%res1)    
+            if head2 == "start2":
+                res2 = self._decodeLaserDate(1, info_str)
+                flag += 1
+                LOG.debug("res2: %s"%res2)
+            if ghclient and flag >= 0:
+                msg = self.encodeUdpMsg([res1,res2])
+                ghclient.broadcast(msg)
+            # count -= 1   # 测试用
+
+    def encodeUdpMsg(self,res_list):
+        msg = ""
+        for res in res_list:
+            msg += ",".join([str(i) for i in res])
+            msg += ";"
+        return msg
 
 def ghUDP(msg):
     udpsever=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
@@ -72,35 +100,41 @@ if __name__=="__main__":
     parser.add_argument('--plc-addr','-pa', type=str, default="192.168.100.1")
     parser.add_argument('--plc-port','-pp', type=int, default=3000)
     global args
+    #=========== 变量初始化 ==========================================
     args = vars(parser.parse_args())
-    start_time = time.clock()
-    print("上海大界机器人科技有限公司")
-    print("\n")
-    print("正在运行红外测试程序....")
-    # task = MyThread(clientGetRes,)
-    plc_port = args['plc_port']
+    start_time = time.clock() # 程序开始计时
     plc_addr = args['plc_addr']
-    print("PLC ip: %s, port: %s"%(plc_addr, plc_port))
-    _thread.start_new_thread(get_time,())
-    count  = 5
-    while count > 0:
-        count -= 1
-        try:
-            res1, res2 = clientGetRes(plc_addr,plc_port)
+    plc_port = args['plc_port']
+    gh_addr = args['gh_addr']
+    gh_port = args['gh_port']
 
-            msg = str(res1[0])
-            for i in range(1, len(res1)):
-                msg = msg +   ',' + str(res1[i])
-            msg += ";"
-            for i in range(len(res2)):
-                msg =  msg + str(res2[i]) + ','
-            print("得到 plc 数据，向grasshopper 广播数据, ip: %s, port: %s"%(args['gh_addr'], args['gh_port']))
-            print("向 gh 端广播从plc采集得到的数据：")
-            ghUDP(msg)
-            print("发送完毕，2秒后关闭程序")
-            time.sleep(2)
+    #=========== 创建日志文件 ==========================================
+    logfilePath = create_TempFolder("RobotsPlc.log")
+    LOG = create_logger("RobotsPlc",logfilePath)
+    LOG.info("上海大界机器人科技有限公司 \n 运行红外测试程序....") 
+    LOG.debug("PLC ip: %s, port: %s"%(plc_addr, plc_port))
+    LOG.debug("Grasshopper ip :%s, port: %s"%(gh_addr, gh_port))
+
+    #=========== 多线程计时 =============================================
+    _thread.start_new_thread(get_time,())
+    count  = 2
+
+    #=========== 分别声明 plc 和 grasshopper 的地址和端口对象 ============= 
+    client = PlcClient(plc_addr, plc_port)
+    ghclient = GhClient(gh_addr, gh_port)
+    #===========
+    try:
+        client.connect()
+    except Exception as e:
+        LOG.error(e)
+
+    #=========== 进入主循环 ==============================================
+    while count > 0:
+        try:
+            client.sendRes(ghclient = ghclient)
         except Exception as e:
-            print("Failure ! ", e)
-            ghUDP("None")
-            # print("2秒后关闭程序")
-            time.sleep(2)
+            LOG.error("Failure! %s"%e)
+            ghclient.broadcast("None")
+            count -= 1
+        time.sleep(2) # 等待两秒
+    client.disconnect()
