@@ -134,6 +134,7 @@ class PlcClient(object):
             if ghclient and flag >= 0:
                 msg = self.encodeUdpMsg([res1,res2])
                 ghclient.broadcast(msg)
+                flag = -1
             # count -= 1   # 测试用
 
     def encodeUdpMsg(self,res_list):
